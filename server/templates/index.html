@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>BTC Model Data Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <div class="bg">
+    <div class="container">
+      <header>
+        <h1>BTC Model Data Dashboard</h1>
+        <p class="subtitle">
+          Model data 
+          <span class="pill">DATA_DIR: {{ data_dir }}</span>
+        </p>
+      </header>
+
+      <section class="grid">
+        <!-- OHLCV -->
+        <div class="card">
+          <h2>Price (OHLCV)</h2>
+          <div class="controls">
+            <label>Symbol
+              <select id="ohlcvSymbol"></select>
+            </label>
+            <label>Last N
+              <input id="ohlcvN" type="number" value="365">
+            </label>
+            <button id="btnOhlcv">Load</button>
+          </div>
+          <div class="chart"><canvas id="ohlcvChart"></canvas></div>
+        </div>
+
+        <!-- Funding -->
+        <div class="card">
+          <h2>Funding Rate</h2>
+          <div class="controls">
+            <label>Exchange
+              <select id="fundEx"></select>
+            </label>
+            <label>Instrument
+              <select id="fundInst"></select>
+            </label>
+            <button id="btnFunding">Load</button>
+          </div>
+          <div class="chart"><canvas id="fundingChart"></canvas></div>
+        </div>
+
+        <!-- Open Interest -->
+        <div class="card">
+          <h2>Open Interest</h2>
+          <div class="controls">
+            <label>Exchange
+              <select id="oiEx"></select>
+            </label>
+            <label>Instrument
+              <select id="oiInst"></select>
+            </label>
+            <button id="btnOI">Load</button>
+          </div>
+          <div class="chart"><canvas id="oiChart"></canvas></div>
+        </div>
+
+        <!-- On-chain -->
+        <div class="card">
+          <h2>On-Chain Metrics</h2>
+          <div class="controls">
+            <label>Source
+              <select id="onchainSource">
+                <option value="onchain_blockchain_dot_com.parquet">blockchain.com</option>
+                <option value="onchain_blockchair.parquet">blockchair</option>
+                <option value="onchain_mempool_space.parquet">mempool.space</option>
+              </select>
+            </label>
+            <label>Metric
+              <select id="onchainMetric"></select>
+            </label>
+            <button id="btnOnchain">Load</button>
+          </div>
+          <div class="chart"><canvas id="onchainChart"></canvas></div>
+        </div>
+
+        <!-- Fear & Greed -->
+        <div class="card">
+          <h2>Fear &amp; Greed</h2>
+          <div class="controls">
+            <button id="btnFNG">Load</button>
+          </div>
+          <div class="chart"><canvas id="fngChart"></canvas></div>
+        </div>
+
+        <!-- Orderbook (placeholder) -->
+        <div class="card">
+          <h2>Orderbook Depth (Latest)</h2>
+          <div class="controls">
+            <label>Exchange
+              <select id="obEx"></select>
+            </label>
+            <label>Symbol
+              <select id="obSym"></select>
+            </label>
+            <button id="btnOB">Load</button>
+          </div>
+          <div class="chart"><canvas id="orderbookChart"></canvas></div>
+          <p class="hint">Depth chart draws cumulative size vs price for best 10 bids/asks if available.</p>
+        </div>
+      </section>
+
+      <!-- Summary Table -->
+      <section class="card mt">
+        <h2>Data Summary</h2>
+        <div class="table-wrap">
+          <table class="table" id="summaryTable">
+            <thead>
+              <tr>
+                <th>Dataset</th>
+                <th>Present</th>
+                <th>Rows</th>
+                <th>Last Timestamp (UTC)</th>
+                <th>Groups (sample)</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <details id="metaPanel" class="mt-sm">
+          <summary>Raw JSON</summary>
+          <pre id="meta"></pre>
+        </details>
+      </section>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

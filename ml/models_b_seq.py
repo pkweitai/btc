@@ -1,33 +1,29 @@
-import numpy as np, torch
-from torch import nn
+
+# Placeholder GRU-free sequence model to avoid torch dependency.
+# We emulate a sequence learner by adding rolling-window aggregated features
+# and training a simple gradient boosting on those "sequence summaries".
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
 from sklearn.metrics import mean_squared_error, log_loss
-class GRUHead(nn.Module):
-    def __init__(self, in_dim, hid=96, num_layers=1):
-        super().__init__()
-        self.gru=nn.GRU(input_size=in_dim, hidden_size=hid, num_layers=num_layers, batch_first=True)
-        self.reg_head=nn.Linear(hid,1); self.clf_head=nn.Linear(hid,1)
-    def forward(self,x):
-        out,_=self.gru(x); h=out[:,-1,:]
-        y_reg=self.reg_head(h).squeeze(-1); y_clf=torch.sigmoid(self.clf_head(h)).squeeze(-1)
-        return y_reg, y_clf
-def make_sequences(X,y,c,win=60):
-    Xv=X.values.astype(np.float32); yv=y.values.astype(np.float32); cv=c.values.astype(np.float32)
-    seq_X,seq_y,seq_c=[],[],[]
-    for i in range(win,len(Xv)):
-        seq_X.append(Xv[i-win:i]); seq_y.append(yv[i]); seq_c.append(cv[i])
-    return np.stack(seq_X), np.array(seq_y), np.array(seq_c)
-def train_gru(X_tr,y_tr,c_tr,X_va,y_va,c_va,win=60,epochs=14,lr=1e-3,wd=1e-5,device='cpu'):
-    trX,trY,trC=make_sequences(X_tr,y_tr,c_tr,win); vaX,vaY,vaC=make_sequences(X_va,y_va,c_va,win)
-    in_dim=trX.shape[-1]; model=GRUHead(in_dim=in_dim,hid=96,num_layers=1).to(device)
-    opt=torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
-    reg_loss=nn.SmoothL1Loss(); clf_loss=nn.BCELoss()
-    trX_t=torch.tensor(trX,device=device); trY_t=torch.tensor(trY,device=device); trC_t=torch.tensor(trC,device=device)
-    vaX_t=torch.tensor(vaX,device=device); vaY_t=torch.tensor(vaY,device=device); vaC_t=torch.tensor(vaC,device=device)
-    for ep in range(epochs):
-        model.train(); opt.zero_grad()
-        yhat,phat=model(trX_t); loss=reg_loss(yhat,trY_t)+clf_loss(phat,trC_t); loss.backward(); opt.step()
-    model.eval()
-    with torch.no_grad(): yv, pv=model(vaX_t)
-    rmse=float(np.sqrt(mean_squared_error(vaY_t.cpu(), yv.cpu())))
-    logl=float(log_loss(vaC_t.cpu(), pv.cpu().clamp(1e-6,1-1e-6)))
-    return model, {'rmse':rmse,'logloss':logl}, win
+
+def make_sequence_summaries(X_df: pd.DataFrame, win: int = 60) -> pd.DataFrame:
+    # rolling mean and std over window for each feature
+    out = X_df.copy()
+    for col in X_df.columns:
+        out[f"{col}_mean{win}"] = X_df[col].rolling(win, min_periods=win//2).mean()
+        out[f"{col}_std{win}"]  = X_df[col].rolling(win, min_periods=win//2).std()
+    return out.dropna()
+
+def train_seq(X_tr_df, y_tr, c_tr, X_va_df, y_va, c_va, win: int = 60):
+    X_tr_s = make_sequence_summaries(pd.DataFrame(X_tr_df, columns=X_tr_df.columns if hasattr(X_tr_df,'columns') else None), win)
+    valid_cut = len(X_tr_df) - len(X_tr_s)
+    y_tr = y_tr[valid_cut:]
+    c_tr = c_tr[valid_cut:]
+    X_va_s = make_sequence_summaries(pd.DataFrame(X_va_df, columns=X_va_df.columns if hasattr(X_va_df,'columns') else None), win)
+    reg = GradientBoostingRegressor(random_state=1).fit(X_tr_s, y_tr)
+    clf = GradientBoostingClassifier(random_state=1).fit(X_tr_s, c_tr.astype(int))
+    # eval
+    rmse = float(np.sqrt(mean_squared_error(y_va[-len(X_va_s):], reg.predict(X_va_s))))
+    logloss = float(log_loss(c_va[-len(X_va_s):].astype(int), clf.predict_proba(X_va_s)[:,1]))
+    return {"reg": reg, "clf": clf, "win": win, "rmse": rmse, "logloss": logloss}

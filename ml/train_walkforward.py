@@ -1,52 +1,155 @@
-import os, json, joblib, numpy as np, pandas as pd, torch
+# ml/train_walkforward.py
+
+from __future__ import annotations
+
+import os
+import argparse
+import warnings
+import pickle
 from datetime import datetime
-from sklearn.preprocessing import StandardScaler
+
+import numpy as np
+import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
-from lightgbm import Booster
-from .features import build_feature_table
-from .models_a_gbdt import train_gbdt
-from .models_b_seq import train_gru, make_sequences, GRUHead
-from .models_c_regime import infer_regime
-from .ensemble import combine
-from .backtest import backtest
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
+
+from .features import load_ohlcv, build_basic_features
+
+
+def log(msg: str) -> None:
+    print(f"[train_walkforward] {msg}")
+
+
+def ensure_parent_dir(path: str) -> None:
+    """Create the parent directory of a file path if it doesn't exist."""
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+
+def feature_engineer(
+    data_dir: str,
+    symbol: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    max_samples: int | None = None,
+) -> pd.DataFrame:
+    df = load_ohlcv(data_dir, symbol)
+    if start:
+        df = df[df["timestamp"] >= pd.to_datetime(start, utc=True)]
+    if end:
+        df = df[df["timestamp"] <= pd.to_datetime(end, utc=True)]
+    if max_samples:
+        df = df.tail(max_samples)
+
+    feat = build_basic_features(df)
+    # keep a tidy frame (timestamp, symbol, close, features..., target)
+    drop_cols = {"timestamp", "symbol", "target_next_ret"}
+    feats = [c for c in feat.columns if c not in drop_cols]
+    keep_cols = ["timestamp", "symbol", "close"] + feats + ["target_next_ret"]
+    return feat[keep_cols].dropna(subset=["target_next_ret"])
+
+
+def build_xy(df_feat: pd.DataFrame):
+    feat_cols = [c for c in df_feat.columns if c not in ("timestamp", "symbol", "target_next_ret")]
+    X = df_feat[feat_cols].to_numpy()
+    y = df_feat["target_next_ret"].to_numpy()
+    return X, y, feat_cols
+
+
+def parse_args():
+    ap = argparse.ArgumentParser(description="Walk-forward training for BTC models.")
+    ap.add_argument("--data-dir", default=None, help="Override DATA_DIR (.env)")
+    ap.add_argument("--symbol", default=None, help="Symbol to train on (e.g., BTC/USDT)")
+    ap.add_argument("--start", default=None, help="ISO start date (UTC)")
+    ap.add_argument("--end", default=None, help="ISO end date (UTC)")
+    ap.add_argument("--n-splits", type=int, default=7, help="TimeSeriesSplit folds (auto-reduced if needed)")
+    ap.add_argument("--max-samples", type=int, default=None, help="Optional cap on rows for speed")
+    ap.add_argument("--save-model", action="store_true", help="Save final model pickle to --out-path or DATA_DIR.")
+    ap.add_argument("--out-path", default=None, help="Explicit output path for model.pkl (overrides default).")
+    return ap.parse_args()
+
+
 def main():
-    X,y,c,feats=build_feature_table(lag_onchain_days=2)
-    tss=TimeSeriesSplit(n_splits=6)
-    results=[]
-    for i,(tr,va) in enumerate(tss.split(X),1):
-        Xtr,Xva=X.iloc[tr],X.iloc[va]; ytr,yva=y.iloc[tr],y.iloc[va]; ctr,cva=c.iloc[tr],c.iloc[va]
-        scaler=StandardScaler().fit(Xtr); Xtr_s=pd.DataFrame(scaler.transform(Xtr),index=Xtr.index,columns=X.columns); Xva_s=pd.DataFrame(scaler.transform(Xva),index=Xva.index,columns=X.columns)
-        reg,clf,cal,metrA=train_gbdt(Xtr_s,ytr,ctr,Xva_s,yva,cva)
-        yA=reg.predict(Xva_s); pA=cal.transform(clf.predict_proba(Xva_s)[:,1])
-        modelB,metrB,win=train_gru(Xtr_s,ytr,ctr,Xva_s,yva,cva,win=60,epochs=12)
-        Xall=pd.concat([Xtr_s,Xva_s]); vaX,_,_=make_sequences(Xall, pd.concat([ytr,yva]), pd.concat([ctr,cva]), win)
-        seq_idx=np.arange(win,len(Xall)); mask_va=seq_idx>=len(Xtr_s); vaX_seq=vaX[mask_va]
-        yB=[]; pB=[]
-        for j in range(len(vaX_seq)):
-            with torch.no_grad():
-                yhat,phat=modelB(torch.tensor(vaX_seq[j:j+1],dtype=torch.float32))
-            yB.append(float(yhat.squeeze())); pB.append(float(phat.squeeze()))
-        yB=np.array(yB); pB=np.array(pB)
-        regime=infer_regime(feats.loc[Xva.index])
-        S,y_bl,p_bl=combine(yA,pA,yB,pB,feats.loc[Xva.index,'vol20'].values, regime)
-        metrics,pnl,cum=backtest(S, yva.values, cost_bps=3.0)
-        results.append({'fold':i,'A':metrA,'B':metrB,'bt':metrics})
-    summary={'cv_sharpe_mean':float(np.mean([r['bt']['sharpe'] for r in results])),'cv_sharpe_std':float(np.std([r['bt']['sharpe'] for r in results])),'folds':results}
-    date_str=datetime.utcnow().strftime('%Y-%m-%d'); outdir=os.path.join('model_registry',date_str); os.makedirs(outdir, exist_ok=True)
-    scaler=StandardScaler().fit(X); Xs=pd.DataFrame(scaler.transform(X), index=X.index, columns=X.columns)
-    reg,clf,cal,_=train_gbdt(Xs,y,c,Xs,y,c)
-    joblib.dump(scaler, os.path.join(outdir,'scaler.pkl'))
-    reg.booster_.save_model(os.path.join(outdir,'lgbm_regressor.txt')); clf.booster_.save_model(os.path.join(outdir,'lgbm_classifier.txt'))
-    joblib.dump(cal, os.path.join(outdir,'calibrator.pkl'))
-    modelB,_,win=train_gru(Xs,y,c,Xs,y,c,win=60,epochs=12); torch.save(modelB.state_dict(), os.path.join(outdir,'gru_model.pt'))
-    with open(os.path.join(outdir,'sequence_spec.json'),'w') as f: json.dump({'win':win,'feature_order':list(X.columns)}, f, indent=2)
-    with open(os.path.join(outdir,'ensemble.json'),'w') as f: json.dump({'weights':{'A':0.55,'B':0.45},'alpha':0.5,'threshold':0.15}, f, indent=2)
-    with open(os.path.join(outdir,'cv_summary.json'),'w') as f: json.dump(summary, f, indent=2)
+    if load_dotenv:
+        load_dotenv(os.environ.get("ENV_FILE", ".env"))
+
+    args = parse_args()
+    data_dir = args.data_dir or os.environ.get("DATA_DIR", "./data")
+    symbol = args.symbol or os.environ.get("SYMBOL", None)
+    n_splits = int(args.n_splits)
+
+    log(f"DATA_DIR={data_dir}")
+    log(f"SYMBOL={symbol}")
+
+    df_feat = feature_engineer(data_dir, symbol, args.start, args.end, args.max_samples)
+    if len(df_feat) < (n_splits + 20):
+        # auto-adjust if dataset is small
+        n_splits = max(3, min(5, len(df_feat) // 50)) or 3
+        log(f"Auto-adjusted n_splits -> {n_splits}")
+
+    X, y, feat_cols = build_xy(df_feat)
+
+    tss = TimeSeriesSplit(n_splits=n_splits)
+    model = RandomForestRegressor(n_estimators=400, max_depth=8, random_state=42, n_jobs=-1)
+
+    rmses, r2s = [], []
+    done_any_fold = False
+    for fold, (tr_idx, va_idx) in enumerate(tss.split(X), 1):
+        done_any_fold = True
+        Xtr, Xva = X[tr_idx], X[va_idx]
+        ytr, yva = y[tr_idx], y[va_idx]
+        model.fit(Xtr, ytr)
+        pred = model.predict(Xva)
+        rmse = float(np.sqrt(mean_squared_error(yva, pred)))
+        r2 = r2_score(yva, pred) if len(np.unique(yva)) > 1 else np.nan
+        rmses.append(rmse)
+        r2s.append(r2)
+        log(f"Fold {fold}/{n_splits}: RMSE={rmse:.6f} R2={r2:.4f}")
+
+    if not done_any_fold:
+        raise RuntimeError("TimeSeriesSplit produced no folds. Insufficient data?")
+
+    log(f"AVG RMSE={np.nanmean(rmses):.6f}, AVG R2={np.nanmean(r2s):.4f}")
+
+    # Train final model on all data
+    model.fit(X, y)
+    log("Trained final model on all samples.")
+
+    # --- Safe feature-importance export ---
     try:
-        live=os.path.join('model_registry','live')
-        if os.path.islink(live) or os.path.exists(live): os.remove(live)
-        os.symlink(date_str, live, target_is_directory=True)
+        fi = getattr(model, "feature_importances_", None)
+        if fi is not None:
+            fi = np.asarray(fi).ravel()
+            n = min(len(feat_cols), len(fi))
+            if n > 0:
+                df_fi = pd.DataFrame({"feature": feat_cols[:n], "importance": fi[:n]}).sort_values(
+                    "importance", ascending=False
+                )
+                out_csv = os.path.join(data_dir, "model_feature_importance.csv")
+                df_fi.to_csv(out_csv, index=False)
+            else:
+                warnings.warn("Feature importances exist but length is zero.")
+        else:
+            warnings.warn("Model has no feature_importances_. Skipping export.")
     except Exception as e:
-        print('Symlink update failed:', e)
-    print(json.dumps(summary, indent=2))
-if __name__=='__main__': main()
+        warnings.warn(f"Could not export feature importances: {e}")
+    # --------------------------------------
+
+    if args.save_model:
+        payload = {"model": model, "features": feat_cols}
+        out_path = args.out_path or os.path.join(data_dir, "model.pkl")
+        ensure_parent_dir(out_path)
+        with open(out_path, "wb") as f:
+            pickle.dump(payload, f)
+        log(f"Saved model -> {out_path}")
+
+
+if __name__ == "__main__":
+    main()
